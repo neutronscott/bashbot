@@ -1,0 +1,520 @@
+#!/bin/bash
+# your average toy bash irc script ...
+# June 2012. Scott Nicholas <mute@scottn.us>
+
+# config
+declare -A bot=(
+	[nick]=neutronbot
+	[cmdch]='$'
+	[user]=mute
+	[name]='bashy bot!'
+)
+servers=(
+	chat.us.freenode.net
+)
+channels=(
+	'#coredump'
+	'#vectori'
+)
+declare -A acl=(
+	['.*!.*mute@scottn.us']=3
+)
+savefile='infobot.save'
+
+# flood control
+_sendq_RATE=5 _sendq_PER=8
+
+runqemu() {
+timeout --kill-after 6 4 /home/mute/qemu-serial/qemu -L /home/mute/qemu-serial \
+-hda hda -net none -m 32 -nographic -vga none -loadvm "$1" 2>/dev/null  <<< "\
+$RANDOM
+$(date -u +%s)
+$2"
+}
+
+#################################################
+####### END OF USER-SERVICABLE VARIABLES ########
+#################################################
+
+# globals. that you don't touch. not config items
+declare -A karma=() info=()
+_IFS=$IFS	#save it.
+_sendq_MAX=$((_sendq_RATE * _sendq_PER))
+_sendq_allowance=$_sendq_MAX
+
+# these need to survive during reload
+#   arrays: _sendq karma _origargs
+(( reloads++ )) || _origargs=( "$0" "$@" )
+: ${nextserv:=0} ${reconnects:=0}
+export reloads curnick nextserv reconnects _sendq_allowance
+
+### command table. [command]=access level.
+declare -A cmdtbl=(
+	[say]=0		[tell]=1	[karma]=0
+	[whoami]=0	[uptime]=0
+	[cat]=1		[forget]=1	[info]=1
+	[dropq]=3	[reload]=3	[raw]=3
+)
+
+### start with the simple stuff
+is_chan()   { [[ $1 = '#'* ]]; }
+irc_send()  { printf '%s\r\n' "$1" >&3; }
+irc_sendq() { _sendq=("$1" "${_sendq[@]}"); }
+privmsg()   { irc_sendq "PRIVMSG $1 :$2"; }
+notice()    { irc_sendq "NOTICE $1 :$2"; }
+
+### connection handling
+irc_connect() {
+	local host port maxtries=3
+
+	# bypass connection, we are reloading..
+	[[ $curnick ]] && return 0
+	while (( reconnects++ < maxtries )); do
+		IFS=: read -r host port <<< "${servers[nextserv]}"
+		echo "*** Connecting to $host:${port:=6667} ..."
+		# incr now so it's ready in case of any sort of disconnect later
+		(( nextserv=(nextserv+1)%${#servers} ))
+		if exec 3<>"/dev/tcp/$host/$port"; then
+			echo "*** Sending login ..."
+			irc_send "NICK ${bot["nick"]}"
+			irc_send "USER ${bot["user"]:-irc} user host :${bot["name"]:-bash bot}"
+
+			IFS=,
+			irc_send "JOIN :${channels[*]}"
+			IFS=$_IFS
+			break
+		fi
+		# failed to connect ...
+	done
+
+	return 0
+}
+
+### incoming handling
+irc_parse() {
+	local src cmd dest params
+
+	if [[ $1 = :* ]]; then
+		read -r src cmd dest params <<< "${1:1}"
+	else
+		read -r cmd dest params <<< "$1"
+	fi
+
+	case "$cmd" in
+		PING)		irc_send "PONG $dest"; ;;
+		PRIVMSG)	h_privmsg "$src" "$dest" "${params:1}"; ;;
+		001)		curnick=$dest; reconnects=0; ;;
+		# useless noise
+		002|003|004|005|251|252|253|254|255|265|266|250|375|372|376|332|333)
+				;;	#do nothing
+		[0-9][0-9][0-9])
+				printf '### %s\n' "${params/:/}"; ;;
+		*)		printf '<<< %s\n' "$1"; ;;
+	esac
+}
+
+h_privmsg() {
+	local src=$1 dest=$2 msg=$3
+	local nick user host
+	local sh cmd msg u alvl=0
+	IFS='!@' read -r nick user host <<< "$src"
+
+	# ctcp handled specially, elsewhere
+	[[ $msg = * ]] && { h_ctcp "$nick" "$dest" "$msg"; return 0; }
+
+	log_read "$nick" "$dest" "$msg"
+
+	### special stuff first
+
+	#info requests / learns handlers
+	if info_request "$nick" "$dest" "$msg" || info_learn "$nick" "$dest" "$msg"; then
+		return
+	fi
+
+	# VM exec.
+	case "$msg" in
+	'$ '*|'4$ '*|'3$ '*|'2$ '*|'sh$ '*|'k93$ '*|'k$ '*)
+		IFS=' ' read -r sh cmd <<< "$msg"
+		sh=${sh%\$*}
+		[[ $sh = k ]] && sh=k93
+		vm_exec "$src" "$nick" "$dest" "$sh" "$cmd"
+		return
+		;;
+	esac
+
+	# commands
+	if [[ $msg = ${bot["cmdch"]}* ]] || [[ $dest = $curnick ]]; then
+		read -r cmd msg <<< "$msg"
+
+		if [[ $dest = $curnick ]]; then
+			#direct replies
+			dest=$nick
+		else
+			cmd=${cmd:${#bot["cmdch"]}}
+		fi
+
+		# first, is it a command? otherwise, waste no more time.
+		[[ ${cmdtbl[$cmd]+set} ]] || return
+
+		# find their access level
+		for u in "${!acl[@]}"; do
+			if [[ $src =~ $u ]]; then
+				alvl=${acl[$u]}
+				break
+			fi
+		done
+
+		(( alvl >= ${cmdtbl[$cmd]} )) || return
+		c_$cmd "$src" "$nick" "$dest" "$msg"
+		return
+	fi
+
+	#scan for karma
+	karma_scan "$nick" "$dest" "$msg"
+}
+
+h_ctcp() {
+	local nick=$1 dest=$2 msg=$3
+	local cmd
+
+	msg="${msg#}"
+	msg="${msg%}"
+	read -r cmd msg <<< "$msg"
+
+	echo "*** $nick CTCP $dest [$cmd]${msg:+ $msg}"
+	case "$cmd" in
+		PING)		notice "$nick" "PING $msg"; ;;
+		VERSION)	notice "$nick" "VERSION some bot. written in bash!"; ;;
+	esac
+}
+
+### log handling/screen printing
+log_read() {
+	local nick=$1 dest=$2 msg=$3
+
+	if [[ $dest = $curnick ]]; then
+		printf '*%s* %s\n' "$nick" "$msg"
+	else
+		printf '<%s:%s> %s\n' "$nick" "$dest" "$msg"
+	fi
+}
+
+log_send() {
+	local cmd dest rest
+	read -r cmd dest rest <<< "$1"
+
+	case "$cmd" in
+	PRIVMSG)
+		printf '[q:%d] ' "${#_sendq[@]}"
+		if is_chan "$dest"; then
+			printf '<%s:%s>' "$curnick" "$dest"
+		else
+			printf '> *%s*' "$dest"
+		fi
+		printf ' %s\n' "${rest:1}"
+		;;
+	NOTICE)
+		if [[ $rest = ** ]]; then
+			rest=${rest///}
+			read -r cmd rest <<< "${rest:1}"
+			printf '[q:%d] *** CTCP [%s] reply to %s%s\n' "${#_sendq[@]}" "$cmd" "$dest" "${rest:+: $rest}"
+		else
+			printf '[q:%d] -%s- %s\n' "${#_sendq[@]}" "$dest" "${rest:1}"
+		fi
+		;;
+	*)
+		printf '[q:%d] >>> %s\n' "${#_sendq[@]}" "$1"
+		;;
+	esac
+}
+
+### outgoing handling
+sendq_dowork() {
+	(( (${#_sendq[@]} > 0) && (SECONDS > _sendq_last) )) || return 0
+
+	(( _sendq_allowance += _sendq_RATE * (SECONDS - _sendq_last) ))
+	(( _sendq_allowance > _sendq_MAX )) && _sendq_allowance=$_sendq_MAX
+
+	while (( (${#_sendq[@]} > 0) && (_sendq_allowance >= _sendq_PER) ))
+	do
+		log_send "${_sendq[@]:(-1)}"
+		irc_send "${_sendq[@]:(-1)}" q
+		unset _sendq[${#_sendq[@]}-1]
+		(( _sendq_allowance -= _sendq_PER ))
+	done
+	_sendq_last=$SECONDS
+}
+
+### command handling [src nick dest msg]
+c_say()    { privmsg "$3" "$4"; }
+c_dropq()  { unset _sendq; }
+c_reload() { reload "$2"; }
+c_raw()     { irc_sendq "$msg"; }
+
+c_tell() {
+	read -r dest msg <<<"$4"
+	privmsg "$dest" "$msg"
+}
+
+c_cat() {
+	[[ $4 = */* ]] && return 1
+
+	while IFS= read -r line; do
+		notice "$2" "$line"
+	done < "$4"
+}
+
+c_whoami() {
+	local src=$1 nick=$2 dest=$3
+	local alvl u
+
+	for u in "${!acl[@]}"; do
+		if [[ $src =~ $u ]]; then
+			alvl=${acl[$u]}
+			break
+		fi
+	done
+
+	if (( alvl > 0 )); then
+		privmsg "$dest" "[$u] alvl:$alvl"
+	else
+		privmsg "$dest" "You're nobody!"
+	fi
+}
+
+c_forget() {
+	local nick=$2 dest=$3 msg=$4
+
+	if [[ ${info[$msg]+set} ]]; then
+		unset info[$msg]
+		privmsg "$dest" "$nick: Ok. I forgot $msg."
+	else
+		privmsg "$dest" "$nick: I never knew $msg."
+	fi
+}
+
+c_info() {
+	local nick=$2 dest=$3 reply="terms:" term
+
+	for term in "${!info[@]}"; do
+		if (( ${#reply} + ${#term} > 200 )); then
+			notice "$nick" "$reply"
+			reply="terms:"
+		fi
+		reply+=" $term"
+	done
+
+	[[ ${reply+set} ]] && notice "$nick" "$reply"
+}
+
+c_uptime() {
+	local nick=$2 dest=$3
+	local d h m s up
+
+	read -r d h m s <<< "$(sec_to_dhms $SECONDS)"
+	printf -v up '%d days, %2d:%02d, %2d channels' "$d" "$h" "$m" "${#channels[@]}"
+	privmsg "$dest" "$curnick up $up"
+}
+
+c_karma() {
+	local nick=$2 dest=$3 msg=$4 reply
+	msg=${msg,,}
+	if [[ $msg = *" "* ]]; then
+		for word in $msg; do
+			msg=${msg//./ }
+			reply+="$word has ${karma[$word]:-no} karma. "
+		done
+		privmsg "$dest" "$reply"
+	else
+		word=${msg//./ }
+		privmsg "$dest" "$msg has ${karma[$msg]:-no} karma."
+	fi
+}
+
+### command subfuncs that don't really fit elsewhere
+sec_to_dhms() {
+	local s=$1 d h m s
+
+	((
+		d  = s / 86400,
+		s -= d * 86400,
+		h  = s / 3600,
+		s -= h * 3600,
+		m  = s / 60,
+		s -= h * 60
+	))
+
+	echo "$d $h $m $s"
+}
+
+info_request() {
+	local nick=$1 dest=$2 msg=$3
+	local key
+
+	[[ $msg = ${curnick}:* ]] || return 1
+	IFS=': ' read -r _ msg <<< "$msg"
+	msg=${msg%\?}
+	case "${msg,,}" in
+	"what is "*|"who is "*|"what are "*|"who are "*)
+		msg=${msg#* * }
+		;;
+	esac
+	key=${msg,,}
+	[[ $key = *" "* ]] && return 1
+
+	echo "*** Info request [$msg]"
+	if [[ -z ${info[$key]} ]]; then
+		echo "    but I don't know it."
+		privmsg "$dest" "$nick: I haven't a clue."
+		return 0
+	fi
+	privmsg "$dest" "$nick: $msg ${info[$key]}"
+
+	return 0
+}
+
+info_learn() {
+	local nick=$1 dest=$2 msg=$3
+	local key verb val direct=0
+
+	#remove directed prefix
+	if [[ $msg = ${curnick}:* ]]; then
+		IFS=': ' read -r _ msg <<< "$msg"
+		direct=1
+	fi
+
+	read -r key verb val <<< "$msg"
+	verb=${verb,,} key=${key,,}
+	[[ $verb = is || $verb = are ]] || return 1
+
+	if [[ ${info[$key]+set} ]]; then
+		(( direct )) && privmsg "$dest" "$nick: I already know $key: ${info[$key]}"
+		return 2
+	fi
+
+	echo "*** Info add [$key]=[$verb $val]"
+	info[$key]="$verb $val"
+
+	return 0
+}
+
+vm_exec() {
+	local src=$1 nick=$2 dest=$3 sh=${4:-4} cmd=$5
+	local output line c url
+
+	echo "[$src] exec [$sh] $cmd"
+
+	mapfile -t output < <(runqemu "_$sh" "$cmd" 2>/dev/null)
+
+	if (( ${#output[@]} > 3 )); then
+		url=$(IFS=$'\n' curl -0 -F 'text=<-' http://san.aq <<<"${output[*]}")
+		read -r _ url <<< "$url"
+	elif (( ${#output[@]} == 0 )); then
+		output='no output within specified time limit.'
+	fi
+
+	for line in "${output[@]}"; do
+		(( c++ < 3 )) || break
+		privmsg "$dest" "$nick: $line"
+	done
+
+	[[ $url ]] && privmsg "$dest" "$nick: ...etc: $url"
+}
+
+karma_scan() {
+	local nick=$1 dest=$2 msg=$3
+	local reqs=0
+
+	for word in $msg; do
+		word=${word//./ }
+		word=${word,,}
+		case "$word" in
+		*?++)
+			word=${word%??}
+			(( reqs++ ))
+			karma_self "$dest" "$nick" "$word" && continue
+			(( karma[$word]++ ))
+			privmsg "$dest" "$word has ${karma[$word]:-no} karma."
+			;;
+		*?--)
+			word=${word%??}
+			(( reqs++ ))
+			karma_self "$dest" "$nick" "$word" && continue
+			(( karma[$word]-- ))
+			privmsg "$dest" "$word has ${karma[$word]:-no} karma."
+			;;
+		esac
+	done
+
+	return $(( reqs > 0 ))
+}
+
+karma_self() {
+	local dest=$1 nick=$2 word=$3
+
+	[[ $nick = $word ]] || return 1
+
+	privmsg "$dest" "Got an ego problem, $nick? We'll bring that down a notch!"
+	(( karma[$word]-- ))
+	privmsg "$dest" "$word has ${karma[$word]} karma."
+
+	return 0
+}
+
+### script handling
+cleanup() {
+	declare -p karma info >"$savefile"
+	irc_send "QUIT :Recv'd SIGTERM or something"
+	exec 3>&-
+	sleep 1
+}
+
+reload() {
+	local tmpfile
+
+	# cannot export arrays. cannot source a fifo. must use temp file. :(
+	tmpfile=$(mktemp)
+	declare -p karma info _sendq _origargs >"$tmpfile" 2>/dev/null
+	# code injection! :O
+	[[ $1 ]] && printf 'notice "%s" "reload %d complete."\n' "$1" "$reloads" >>"$tmpfile"
+	echo "*** Exec: ${_origargs[@]} -l $tmpfile"
+	exec "${_origargs[@]}" -l "$tmpfile"
+}
+
+### main
+main() {
+	local retval line
+
+	while irc_connect; do
+		[[ $curnick ]] || echo "*** Connection complete."
+		retval=0
+		while IFS= read -t .5 -u 3 -r line || { retval=$?; (( retval > 128 )); }; do
+			if (( retval > 128 )); then
+				retval=0
+			else
+				line=${line%$'\n'}
+				line=${line%$'\r'}
+				irc_parse "$line"
+			fi
+			sendq_dowork
+		done #read loop
+		echo "*** READ ERROR $retval: $errtext"
+		unset curnick
+	done #reconnect loop
+}
+
+[[ -r $savefile ]] && . "$savefile"
+trap cleanup EXIT
+trap reload SIGHUP
+
+# FIXME: real option parsing
+if [[ $1 = '-l' ]]; then
+	echo "*** Reloading arrays from $2"
+	printf '\n\n'
+	cat "$2"
+	printf '\n\n'
+	source "$2"
+	unlink "$2" && echo "*** $2 removed."
+fi
+
+main
