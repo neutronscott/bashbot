@@ -51,7 +51,7 @@ export reloads curnick nextserv reconnects _sendq_allowance
 ### command table. [command]=access level.
 declare -A cmdtbl=(
 	[say]=0		[tell]=1	[karma]=0
-	[whoami]=0	[uptime]=0
+	[whoami]=0	[uptime]=0	[top10]=0
 	[cat]=1		[forget]=1	[info]=1
 	[dropq]=3	[reload]=3	[raw]=3
 )
@@ -331,6 +331,21 @@ c_karma() {
 	fi
 }
 
+c_top10() {
+	local nick=$2 dest=$3 k reply
+
+
+	while read -r num data
+	do
+		reply+=" [$data]:$num"
+	done < <(for k in "${!karma[@]}"
+		do
+			printf '%d %s\n' "${karma[$k]}" "$k"
+		done |sort -rnk1
+	)
+	privmsg "$dest" "Karma top 10: $reply"
+}
+
 ### command subfuncs that don't really fit elsewhere
 sec_to_dhms() {
 	local s=$1 d h m s
@@ -472,6 +487,7 @@ cleanup() {
 reload() {
 	local tmpfile
 
+	declare -p karma info >"$savefile"
 	# cannot export arrays. cannot source a fifo. must use temp file. :(
 	tmpfile=$(mktemp)
 	declare -p karma info _sendq _origargs >"$tmpfile" 2>/dev/null
