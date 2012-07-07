@@ -11,22 +11,33 @@ declare -A bot=(
 )
 servers=(
 	chat.us.freenode.net
+	chat.freenode.net
 )
-channels=(
-	'#coredump'
-	'#vectori'
+# ['channel']='flags'
+# flags are:
+#   u - catch urls: shorten and show title
+#   k - scan for karma
+#   e - VM exec
+## these are actually saved in the savefile, so probably edit it after
+## first run!
+declare -A channels=(
+	['#coredump']='euk'
+	['#vectori']='euk'
 )
 declare -A acl=(
 	['.*!.*mute@scottn.us']=3
 )
 savefile='infobot.save'
+pws=1
 
 # flood control
 _sendq_RATE=5 _sendq_PER=8
 
+json() { ./json ${@/#/-e } -u 2>/dev/null; }
+
 runqemu() {
 timeout --kill-after 6 4 /home/mute/qemu-serial/qemu -L /home/mute/qemu-serial \
--hda hda -net none -m 32 -nographic -vga none -loadvm "$1" 2>/dev/null  <<< "\
+-hda hda -net none -m 32 -nographic -vga none -loadvm "root$1" <<< "\
 $RANDOM
 $(date -u +%s)
 $2"
@@ -52,7 +63,9 @@ export reloads curnick nextserv reconnects _sendq_allowance
 declare -A cmdtbl=(
 	[say]=0		[tell]=1	[karma]=0
 	[whoami]=0	[uptime]=0	[top10]=0
+	[google]=0	[wx]=0		[wxs]=0
 	[cat]=1		[forget]=1	[info]=1
+	[pws]=1		[chan]=1
 	[dropq]=3	[reload]=3	[raw]=3
 )
 
@@ -80,7 +93,7 @@ irc_connect() {
 			irc_send "USER ${bot["user"]:-irc} user host :${bot["name"]:-bash bot}"
 
 			IFS=,
-			irc_send "JOIN :${channels[*]}"
+			irc_send "JOIN :${!channels[*]}"
 			IFS=$_IFS
 			break
 		fi
@@ -132,15 +145,17 @@ h_privmsg() {
 	fi
 
 	# VM exec.
-	case "$msg" in
-	'$ '*|'4$ '*|'3$ '*|'2$ '*|'sh$ '*|'k93$ '*|'k$ '*)
-		IFS=' ' read -r sh cmd <<< "$msg"
-		sh=${sh%\$*}
-		[[ $sh = k ]] && sh=k93
-		vm_exec "$src" "$nick" "$dest" "$sh" "$cmd"
-		return
-		;;
-	esac
+	if test_chanflags "$dest" e; then
+		case "$msg" in
+		'$ '*|'4$ '*|'3$ '*|'2$ '*|'sh$ '*|'k93$ '*|'k$ '*)
+			IFS=' ' read -r sh cmd <<< "$msg"
+			sh=${sh:0:1}
+			[[ $sh = '$' || $sh = '4' ]] && sh=''
+			vm_exec "$src" "$nick" "$dest" "$sh" "$cmd"
+			return
+			;;
+		esac
+	fi
 
 	# commands
 	if [[ $msg = ${bot["cmdch"]}* ]] || [[ $dest = $curnick ]]; then
@@ -346,7 +361,119 @@ c_top10() {
 	privmsg "$dest" "Karma top 10: $reply"
 }
 
+c_google() {
+	local nick=$2 dest=$3 term=$4
+	local title url
+
+	json=$(curl -s --get --data-urlencode "q=$term" 'http://ajax.googleapis.com/ajax/services/search/web?v=1.0')
+	title=$(json responseData results 0 titleNoFormatting <<< "$json")
+	url=$(json responseData results 0 url <<< "$json")
+	privmsg "$dest" "$nick: $title $url"
+}
+
+c_wx() {
+	local nick=$2 dest=$3 place=${4,,}
+	local json title temp feels wind fc=0 day fctext reply
+
+	if [[ $place = *forecast* ]]; then
+		place=${place/forecast//}
+		fc=1
+	fi
+	json=$(wget -q -O - "http://api.wunderground.com/api/1f524830dcb29a41/conditions/forecast/geolookup/pws:${pws}/q/${place}.json")
+
+	# was ambiguous?
+	reply=$(json response results 0 l <<< "$json")
+	if [[ $reply ]]; then
+		json=$(wget -q -O - "http://api.wunderground.com/api/1f524830dcb29a41/conditions/forecast/geolookup/${reply}.json")
+	fi
+
+	# was error?
+	title=$(json response error description <<< "$json")
+	if [[ $title ]]; then
+		privmsg "$dest" "$nick: $title"
+		return
+	fi
+
+	# is empty...?
+	title=$(json current_observation display_location full <<< "$json")
+	if [[ -z $title ]]; then
+		privmsg "$dest" "$nick: Bugger if I know."
+		return
+	fi
+	temp=$(json current_observation temperature_string <<< "$json")
+	feels=$(json current_observation feelslike_string <<< "$json")
+	wind=$(json current_observation wind_string <<< "$json")
+	privmsg "$dest" "$nick: $title -- $temp, feels like $feels. Wind $wind."
+	if (( fc )); then
+		unset reply
+		for ((day = 0; day < 3; day++)); do
+			title=$(json forecast simpleforecast forecastday "$day" date weekday_short <<< "$json")
+			fctxt=$(json forecast simpleforecast forecastday "$day" conditions <<< "$json")
+			reply+=" $title: $fctxt"
+		done
+		privmsg "$dest" "$nick: ${reply:1}"
+	fi
+}
+
+c_pws() {
+	local nick=$2 dest=$3 msg=${4,,}
+
+	case "$msg" in
+		on) pws=1; privmsg "$dest" "$nick: Ok. PWS is now on." ;;
+		off) pws=0; privmsg "$dest" "$nick: Ok. PWS is now off." ;;
+		*) privmsg "$dest" "$nick: PWS is currently $pws" ;;
+	esac
+}
+
+c_chan() {
+	local nick=$2 dest=$3 args=${4,,}
+	local chan flags
+	read -r chan flags <<< "$args"
+
+	if [[ -z $flags ]]; then
+		if [[ ${channels[$chan]+set} ]]; then
+			privmsg "$dest" "Flags for $chan: ${channels[$chan]}"
+		else
+			privmsg "$dest" "I'm not familiar with $chan"
+		fi
+		return
+	fi
+	channels[$chan]=$flags
+	irc_send "JOIN :$chan"
+}
+
+c_wxs() {
+	local nick=$2 dest=$3 place=${4,,}
+	local json reply
+
+	json=$(wget -q -O - "http://api.wunderground.com/api/1f524830dcb29a41/conditions/pws:${pws}/q/${place}.json")
+	reply=$(json response error description <<< "$json")
+	if [[ $title ]]; then
+		privmsg "$dest" "$nick: $title"
+		return
+	fi
+	reply="$(json current_observation station_id <<< "$json") -- "
+	reply+=$(json current_observation observation_location full <<< "$json")
+
+	privmsg "$dest" "$nick: Observation Station $reply."
+}
+
 ### command subfuncs that don't really fit elsewhere
+test_chanflags() {
+	local chan=$1 flags=${2,,}
+	local i l f
+
+	is_chan "$chan" || return 0	# do anything in private ;)
+	[[ ${channels[$chan]+set} ]] || return 1
+
+	l=${#flags}
+	for ((i = 0; i < l; i++)); do
+		[[ ${channels[$chan]} = *${flags:i:1}* ]] && return 0
+	done
+
+	return 1
+}
+
 sec_to_dhms() {
 	local s=$1 d h m s
 
@@ -414,12 +541,12 @@ info_learn() {
 }
 
 vm_exec() {
-	local src=$1 nick=$2 dest=$3 sh=${4:-4} cmd=$5
+	local src=$1 nick=$2 dest=$3 sh=$4 cmd=$5
 	local output line c url
 
 	echo "[$src] exec [$sh] $cmd"
 
-	mapfile -t output < <(runqemu "_$sh" "$cmd" 2>/dev/null)
+	mapfile -t output < <(runqemu "$sh" "$cmd")
 
 	if (( ${#output[@]} > 3 )); then
 		url=$(IFS=$'\n' curl -0 -F 'text=<-' http://san.aq <<<"${output[*]}")
@@ -436,11 +563,31 @@ vm_exec() {
 	[[ $url ]] && privmsg "$dest" "$nick: ...etc: $url"
 }
 
+url_catcher() {
+	local nick=$1 dest=$2 url=$3
+	local title
+
+	title=$(./htitle <(curl -Ls "$url"))
+	[[ $title ]] || return
+
+	url=$(IFS=$'\n' curl -0 -F "url=$url" http://san.aq)
+	read -r _ url <<< "$url"
+
+	privmsg "$dest" "[$url] $title"
+}
+
 karma_scan() {
 	local nick=$1 dest=$2 msg=$3
 	local reqs=0
 
+	test_chanflags "$dest" "uk" || return
+
 	for word in $msg; do
+		if [[ $word = http://* ]] && test_chanflags "$dest" u; then
+			url_catcher "$nick" "$dest" "$msg"
+		fi
+		test_chanflags "$dest" k || continue
+
 		word=${word//./ }
 		word=${word,,}
 		case "$word" in
@@ -478,7 +625,7 @@ karma_self() {
 
 ### script handling
 cleanup() {
-	declare -p karma info >"$savefile"
+	declare -p karma info channels >"$savefile"
 	irc_send "QUIT :Recv'd SIGTERM or something"
 	exec 3>&-
 	sleep 1
@@ -487,7 +634,7 @@ cleanup() {
 reload() {
 	local tmpfile
 
-	declare -p karma info >"$savefile"
+	declare -p karma info channels >"$savefile"
 	# cannot export arrays. cannot source a fifo. must use temp file. :(
 	tmpfile=$(mktemp)
 	declare -p karma info _sendq _origargs >"$tmpfile" 2>/dev/null
