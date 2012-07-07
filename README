@@ -1,6 +1,13 @@
 look at it. run it.
 
-requires bash4 with networking.
+requires:
+ * bash4 with networking.
+ * qemu for VM execution (hda included, will include rootfs build files soon)
+ * perl for url titles.
+ * curl for google api.
+ * sort for karma top10.
+ * wget for weather api.
+ * jshon for weather and google api.
 
 questions? find me on IRC
 
