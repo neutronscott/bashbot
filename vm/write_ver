@@ -1,0 +1,7 @@
+#!/bin/sh
+
+build=$(cat .build)
+build=$(( 1 + build ))
+echo "$build" >.build
+echo "Build #$build [$(date)]" | tee root/etc/release
+rm -f root/root/.bash_history #der

@@ -1,0 +1,21 @@
+#!/bin/bash
+PATH=$PATH:/home/mute/qemu-serial
+image="$1"
+state=$2
+
+mkfifo fifo # &> /dev/null
+[[ -r fifo && -w fifo && -p fifo ]] || { echo "fifo fail"; exit 1; } 
+
+< fifo qemu -L /home/mute/qemu-serial -kernel bzImage -append "rdinit=/init console=ttyS1,9600n8 -- $state" -initrd initramfs.cpio.gz -hda "$image" -net none -m 32 -nographic -vga none |
+	while read f
+	do
+		echo "$f" >&2
+		[[ $f == *"init started"* ]] && { 
+			sleep 5
+			echo $'\x01c'
+			echo "savevm $state"
+			echo 'quit'
+		}
+	done > fifo
+
+rm -f fifo
