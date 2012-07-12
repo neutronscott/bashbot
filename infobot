@@ -10,6 +10,7 @@ declare -A bot=(
 	[name]='bashy bot!'
 )
 servers=(
+	verne.freenode.net
 	chat.us.freenode.net
 	chat.freenode.net
 )
@@ -18,8 +19,8 @@ servers=(
 #   u - catch urls: shorten and show title
 #   k - scan for karma
 #   e - VM exec
-## these are actually saved in the savefile, so probably edit it after
-## first run!
+## these are actually saved in the savefile, so probably move it after
+## first run.
 declare -A channels=(
 	['#coredump']='euk'
 	['#vectori']='euk'
@@ -28,12 +29,13 @@ declare -A acl=(
 	['.*!.*mute@scottn.us']=3
 )
 savefile='infobot.save'
+# weather command: use personal weather stations
 pws=1
 
 # flood control
 _sendq_RATE=5 _sendq_PER=8
 
-json() { ./json ${@/#/-e } -u 2>/dev/null; }
+json() { ./jshon ${@/#/-e } -u 2>/dev/null; }
 
 runqemu() {
 timeout --kill-after 6 4 /home/mute/qemu-serial/qemu -L /home/mute/qemu-serial \
@@ -64,6 +66,7 @@ declare -A cmdtbl=(
 	[say]=0		[tell]=1	[karma]=0
 	[whoami]=0	[uptime]=0	[top10]=0
 	[google]=0	[wx]=0		[wxs]=0
+	[wxf]=0		[cmds]=0	[help]=0
 	[cat]=1		[forget]=1	[info]=1
 	[pws]=1		[chan]=1
 	[dropq]=3	[reload]=3	[raw]=3
@@ -80,8 +83,11 @@ notice()    { irc_sendq "NOTICE $1 :$2"; }
 irc_connect() {
 	local host port maxtries=3
 
-	# bypass connection, we are reloading..
-	[[ $curnick ]] && return 0
+	# bypass connection, we are reloading and already connected.
+	if [[ $curnick ]]; then
+		echo "*** Already connected."
+		return 0
+	fi
 	while (( reconnects++ < maxtries )); do
 		IFS=: read -r host port <<< "${servers[nextserv]}"
 		echo "*** Connecting to $host:${port:=6667} ..."
@@ -105,44 +111,64 @@ irc_connect() {
 
 ### incoming handling
 irc_parse() {
+	local line=$1
 	local src cmd dest params
 
-	if [[ $1 = :* ]]; then
-		read -r src cmd dest params <<< "${1:1}"
+	if [[ $line = :* ]]; then
+		read -r src cmd dest params <<< "${line:1}"
 	else
-		read -r cmd dest params <<< "$1"
+		read -r cmd dest params <<< "$line"
 	fi
 
 	case "$cmd" in
-		PING)		irc_send "PONG $dest"; ;;
-		PRIVMSG)	h_privmsg "$src" "$dest" "${params:1}"; ;;
-		001)		curnick=$dest; reconnects=0; ;;
+		PING)		irc_send "PONG $dest" ;;
+		PRIVMSG)	h_privmsg "$src" "$dest" "${params:1}" ;;
+		QUIT)		h_leave "$src" "$dest" quit ;;
+		PART)		h_leave "$src" "$dest" part ;;
+		JOIN)		h_join "$src" "$dest" ;;
+		001)		curnick=$dest; reconnects=0 ;;
 		# useless noise
 		002|003|004|005|251|252|253|254|255|265|266|250|375|372|376|332|333)
 				;;	#do nothing
 		[0-9][0-9][0-9])
-				printf '### %s\n' "${params/:/}"; ;;
-		*)		printf '<<< %s\n' "$1"; ;;
+				printf '### %s\n' "${params/:/}" ;;
+		*)		printf '<<< %s\n' "$line" ;;
 	esac
+}
+
+h_leave() {
+	local src=$1 dest=$2 msg=$2 how=${3^^}
+	local nick user host
+
+	IFS='!@' read -r nick user host <<< "$src"
+	if [[ $how = QUIT ]]; then
+		echo "*** $nick QUIT ($msg)"
+	else
+		echo "*** $nick PART $dest"
+	fi
+}
+
+h_join() {
+	local src=$1 dest=$2
+	local nick user host
+
+	IFS='!@' read -r nick user host <<< "$src"
+	echo "*** $nick JOIN $dest"
 }
 
 h_privmsg() {
 	local src=$1 dest=$2 msg=$3
 	local nick user host
-	local sh cmd msg u alvl=0
+	local direct=0 sh cmd args u alvl=0
 	IFS='!@' read -r nick user host <<< "$src"
 
 	# ctcp handled specially, elsewhere
-	[[ $msg = * ]] && { h_ctcp "$nick" "$dest" "$msg"; return 0; }
+	if [[ $msg = * ]]; then
+		h_ctcp "$nick" "$dest" "$msg"
+		return 0
+	fi
 
 	log_read "$nick" "$dest" "$msg"
-
-	### special stuff first
-
-	#info requests / learns handlers
-	if info_request "$nick" "$dest" "$msg" || info_learn "$nick" "$dest" "$msg"; then
-		return
-	fi
 
 	# VM exec.
 	if test_chanflags "$dest" e; then
@@ -157,35 +183,50 @@ h_privmsg() {
 		esac
 	fi
 
-	# commands
-	if [[ $msg = ${bot["cmdch"]}* ]] || [[ $dest = $curnick ]]; then
-		read -r cmd msg <<< "$msg"
-
-		if [[ $dest = $curnick ]]; then
-			#direct replies
-			dest=$nick
-		else
-			cmd=${cmd:${#bot["cmdch"]}}
-		fi
-
-		# first, is it a command? otherwise, waste no more time.
-		[[ ${cmdtbl[$cmd]+set} ]] || return
-
-		# find their access level
-		for u in "${!acl[@]}"; do
-			if [[ $src =~ $u ]]; then
-				alvl=${acl[$u]}
-				break
+	# you talkin' to me?
+	if msg=$(directed_msg "$msg"); then
+		direct=1
+		read -r cmd args <<< "$msg"
+	elif [[ $msg = ${bot["cmdch"]}* ]]; then
+		msg=${msg:${#bot["cmdch"]}}
+		read -r cmd args <<< "$msg"
+	elif [[ $dest = $curnick ]]; then
+		read -r cmd args <<< "$msg"
+		#direct replies
+		dest=$nick
+	else
+		#not directly to me..
+		if test_chanflags "$dest" i; then
+			if info_request "$nick" "$dest" "$msg" 1 || info_learn "$nick" "$dest" "$msg" 1; then
+				return
 			fi
-		done
-
-		(( alvl >= ${cmdtbl[$cmd]} )) || return
-		c_$cmd "$src" "$nick" "$dest" "$msg"
+		fi
+		#scan for karma
+		karma_scan "$nick" "$dest" "$msg"
 		return
 	fi
 
-	#scan for karma
-	karma_scan "$nick" "$dest" "$msg"
+	# it is a command?
+	if ! [[ ${cmdtbl[$cmd]+set} ]]; then
+		# only after failing all this, then do infos
+		if info_request "$nick" "$dest" "$msg" 0 || info_learn "$nick" "$dest" "$msg" 0; then
+			return
+		fi
+		privmsg "$dest" "$nick: $cmd: command not found"
+		return
+	fi
+
+	# find their access level
+	for u in "${!acl[@]}"; do
+		if [[ $src =~ $u ]]; then
+			alvl=${acl[$u]}
+			break
+		fi
+	done
+
+	(( alvl >= ${cmdtbl[$cmd]} )) || return
+	c_$cmd "$src" "$nick" "$dest" "$args"
+	return
 }
 
 h_ctcp() {
@@ -198,8 +239,8 @@ h_ctcp() {
 
 	echo "*** $nick CTCP $dest [$cmd]${msg:+ $msg}"
 	case "$cmd" in
-		PING)		notice "$nick" "PING $msg"; ;;
-		VERSION)	notice "$nick" "VERSION some bot. written in bash!"; ;;
+		PING)		notice "$nick" "PING $msg" ;;
+		VERSION)	notice "$nick" "VERSION some bot. written in bash!" ;;
 	esac
 }
 
@@ -254,17 +295,40 @@ sendq_dowork() {
 	do
 		log_send "${_sendq[@]:(-1)}"
 		irc_send "${_sendq[@]:(-1)}" q
-		unset _sendq[${#_sendq[@]}-1]
+		unset "_sendq[${#_sendq[@]}-1]"
 		(( _sendq_allowance -= _sendq_PER ))
 	done
 	_sendq_last=$SECONDS
 }
 
 ### command handling [src nick dest msg]
+c_cmds()   { c_help "$@"; }
 c_say()    { privmsg "$3" "$4"; }
 c_dropq()  { unset _sendq; }
 c_reload() { reload "$2"; }
-c_raw()     { irc_sendq "$msg"; }
+c_raw()    { irc_sendq "$msg"; }
+
+c_help() {
+	local src=$1 nick=$2 dest=$3
+	local u alvl reply
+
+	# find their access level
+	for u in "${!acl[@]}"; do
+		if [[ $src =~ $u ]]; then
+			alvl=${acl[$u]}
+			break
+		fi
+	done
+
+	for cmd in "${!cmdtbl[@]}"; do
+		if (( alvl >= ${cmdtbl[$cmd]} )); then
+			reply+=" [$cmd]"
+		fi
+	done
+	if [[ $reply ]]; then
+		notice "$nick" "Commands available to you:$reply"
+	fi
+}
 
 c_tell() {
 	read -r dest msg <<<"$4"
@@ -301,7 +365,7 @@ c_forget() {
 	local nick=$2 dest=$3 msg=$4
 
 	if [[ ${info[$msg]+set} ]]; then
-		unset info[$msg]
+		unset "info[$msg]"
 		privmsg "$dest" "$nick: Ok. I forgot $msg."
 	else
 		privmsg "$dest" "$nick: I never knew $msg."
@@ -371,14 +435,13 @@ c_google() {
 	privmsg "$dest" "$nick: $title $url"
 }
 
-c_wx() {
-	local nick=$2 dest=$3 place=${4,,}
-	local json title temp feels wind fc=0 day fctext reply
+# include forecast
+c_wxf() { c_wx "$@" 1; }
 
-	if [[ $place = *forecast* ]]; then
-		place=${place/forecast//}
-		fc=1
-	fi
+c_wx() {
+	local nick=$2 dest=$3 place=${4,,} fc=$5
+	local json title temp feels wind day fctext reply
+
 	json=$(wget -q -O - "http://api.wunderground.com/api/1f524830dcb29a41/conditions/forecast/geolookup/pws:${pws}/q/${place}.json")
 
 	# was ambiguous?
@@ -400,11 +463,12 @@ c_wx() {
 		privmsg "$dest" "$nick: Bugger if I know."
 		return
 	fi
-	temp=$(json current_observation temperature_string <<< "$json")
-	feels=$(json current_observation feelslike_string <<< "$json")
-	wind=$(json current_observation wind_string <<< "$json")
-	privmsg "$dest" "$nick: $title -- $temp, feels like $feels. Wind $wind."
-	if (( fc )); then
+	if ! (( fc )); then
+		temp=$(json current_observation temperature_string <<< "$json")
+		feels=$(json current_observation feelslike_string <<< "$json")
+		wind=$(json current_observation wind_string <<< "$json")
+		privmsg "$dest" "$nick: $title -- $temp, feels like $feels. Wind $wind."
+	else
 		unset reply
 		for ((day = 0; day < 3; day++)); do
 			title=$(json forecast simpleforecast forecastday "$day" date weekday_short <<< "$json")
@@ -489,54 +553,92 @@ sec_to_dhms() {
 	echo "$d $h $m $s"
 }
 
-info_request() {
-	local nick=$1 dest=$2 msg=$3
-	local key
+directed_msg() {
+	local msg=$1
+	local retval=1
 
-	[[ $msg = ${curnick}:* ]] || return 1
-	IFS=': ' read -r _ msg <<< "$msg"
-	msg=${msg%\?}
+	if [[ $msg = ${curnick}[:,\ ]* ]]; then
+		IFS=':, ' read -r _ msg <<< "$msg"
+		retval=0
+	fi
+
+	echo "$msg"
+	return $retval
+}
+
+# return 1 only if it did not seem like a valid info request!
+info_request() {
+	local nick=$1 dest=$2 msg=$3 quiet=$4
+	local key reply
+
+	# reply to what/who/where is <term>, or simply <term>?
 	case "${msg,,}" in
-	"what is "*|"who is "*|"what are "*|"who are "*)
+	"what is "*|"who is "*|"where is "*)
 		msg=${msg#* * }
 		;;
+	*)
+		#lame. it's a learn instead... my logic is flawed?
+		[[ $msg = *' is '* ]] && return 1
+		if (( quiet )) && [[ $msg != *'?' ]]; then
+			return 1
+		fi
+		;;
 	esac
+	msg=${msg%\?}
 	key=${msg,,}
-	[[ $key = *" "* ]] && return 1
 
 	echo "*** Info request [$msg]"
 	if [[ -z ${info[$key]} ]]; then
 		echo "    but I don't know it."
-		privmsg "$dest" "$nick: I haven't a clue."
-		return 0
+		if (( quiet )); then
+			return 1
+		else
+			privmsg "$dest" "$nick: I don't know about \"$key\"."
+			return 0
+		fi
 	fi
-	privmsg "$dest" "$nick: $msg ${info[$key]}"
+
+	reply=${info[$key]}
+	reply=${reply/'$nick'/$nick}
+	case "$reply" in
+	'<action>'*)
+		reply=${reply#* }
+		privmsg "$dest" "ACTION $reply"
+		;;
+	'<reply>'*)
+		reply=${reply#* }
+		privmsg "$dest" "$reply"
+		;;
+	*)
+		privmsg "$dest" "$nick: $msg is $reply"
+		;;
+	esac
 
 	return 0
 }
 
 info_learn() {
-	local nick=$1 dest=$2 msg=$3
-	local key verb val direct=0
+	local nick=$1 dest=$2 msg=$3 quiet=$4
+	local key val change=0
 
-	#remove directed prefix
-	if [[ $msg = ${curnick}:* ]]; then
-		IFS=': ' read -r _ msg <<< "$msg"
-		direct=1
+	[[ $msg = *' is '* ]] || return 1
+
+	key=${msg%% is *}
+	val=${msg#* is }
+
+	if [[ $key = 'no, '* ]]; then
+		(( quiet )) || change=1
+		key=${key#no, }
 	fi
 
-	read -r key verb val <<< "$msg"
-	verb=${verb,,} key=${key,,}
-	[[ $verb = is || $verb = are ]] || return 1
-
-	if [[ ${info[$key]+set} ]]; then
-		(( direct )) && privmsg "$dest" "$nick: I already know $key: ${info[$key]}"
-		return 2
+	if (( change == 0 )) && [[ ${info[$key]+set} ]]; then
+		(( quiet )) || privmsg "$dest" "$nick: I already know $key: ${info[$key]}"
+		return 0
 	fi
 
-	echo "*** Info add [$key]=[$verb $val]"
-	info[$key]="$verb $val"
-
+	echo "*** Info add [$key]=[$val]"
+	info[$key]=$val
+	(( quiet )) || privmsg "$dest" "$nick: Ok."
 	return 0
 }
 
@@ -584,7 +686,7 @@ karma_scan() {
 
 	for word in $msg; do
 		if [[ $word = http://* ]] && test_chanflags "$dest" u; then
-			url_catcher "$nick" "$dest" "$msg"
+			url_catcher "$nick" "$dest" "$word"
 		fi
 		test_chanflags "$dest" k || continue
 
@@ -640,6 +742,9 @@ reload() {
 	declare -p karma info _sendq _origargs >"$tmpfile" 2>/dev/null
 	# code injection! :O
 	[[ $1 ]] && printf 'notice "%s" "reload %d complete."\n' "$1" "$reloads" >>"$tmpfile"
+
+	# could be written without eval but whateves.
+	eval exec {4..255}'>&-'	# :O
 	echo "*** Exec: ${_origargs[@]} -l $tmpfile"
 	exec "${_origargs[@]}" -l "$tmpfile"
 }
