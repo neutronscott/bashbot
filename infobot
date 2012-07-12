@@ -59,7 +59,7 @@ _sendq_allowance=$_sendq_MAX
 #   arrays: _sendq karma _origargs
 (( reloads++ )) || _origargs=( "$0" "$@" )
 : ${nextserv:=0} ${reconnects:=0}
-export reloads curnick nextserv reconnects _sendq_allowance
+export reloads curnick nextserv reconnects uptime _sendq_allowance
 
 ### command table. [command]=access level.
 declare -A cmdtbl=(
@@ -196,10 +196,12 @@ h_privmsg() {
 		dest=$nick
 	else
 		#not directly to me..
+		# is this even a good idea? :)
 		if test_chanflags "$dest" i; then
-			if info_request "$nick" "$dest" "$msg" 1 || info_learn "$nick" "$dest" "$msg" 1; then
-				return
-			fi
+			info_request "$nick" "$dest" "$msg" 1 && return
+#			if info_request "$nick" "$dest" "$msg" 1 || info_learn "$nick" "$dest" "$msg" 1; then
+#				return
+#			fi
 		fi
 		#scan for karma
 		karma_scan "$nick" "$dest" "$msg"
@@ -380,7 +382,7 @@ c_info() {
 			notice "$nick" "$reply"
 			reply="terms:"
 		fi
-		reply+=" $term"
+		reply+=" [$term]"
 	done
 
 	[[ ${reply+set} ]] && notice "$nick" "$reply"
@@ -390,7 +392,7 @@ c_uptime() {
 	local nick=$2 dest=$3
 	local d h m s up
 
-	read -r d h m s <<< "$(sec_to_dhms $SECONDS)"
+	read -r d h m s <<< "$( sec_to_dhms $((uptime+SECONDS)) )"
 	printf -v up '%d days, %2d:%02d, %2d channels' "$d" "$h" "$m" "${#channels[@]}"
 	privmsg "$dest" "$curnick up $up"
 }
@@ -481,11 +483,14 @@ c_wx() {
 
 c_pws() {
 	local nick=$2 dest=$3 msg=${4,,}
+	local onoff=disabled
 
 	case "$msg" in
 		on) pws=1; privmsg "$dest" "$nick: Ok. PWS is now on." ;;
 		off) pws=0; privmsg "$dest" "$nick: Ok. PWS is now off." ;;
-		*) privmsg "$dest" "$nick: PWS is currently $pws" ;;
+		*)
+			(( pws )) && onoff=enabled
+			privmsg "$dest" "$nick: Personal weather stations are currently $onoff." ;;
 	esac
 }
 
@@ -579,8 +584,9 @@ info_request() {
 	*)
 		#lame. it's a learn instead... my logic is flawed?
 		[[ $msg = *' is '* ]] && return 1
-		if (( quiet )) && [[ $msg != *'?' ]]; then
-			return 1
+		if [[ $msg != *'?' ]]; then
+			(( quiet )) && return 1
+			quiet=1
 		fi
 		;;
 	esac
@@ -588,6 +594,11 @@ info_request() {
 	key=${msg,,}
 
 	echo "*** Info request [$msg]"
+	while [[ ${info[$key]} = '#'* ]]; do
+		echo "***   redir [$key]->[${info[$key]#'#'}]"
+		key=${info[$key]#'#'}
+
+	done
 	if [[ -z ${info[$key]} ]]; then
 		echo "    but I don't know it."
 		if (( quiet )); then
@@ -599,7 +610,8 @@ info_request() {
 	fi
 
 	reply=${info[$key]}
-	reply=${reply/'$nick'/$nick}
+	reply=${reply//'$me'/$curnick}
+	reply=${reply//'$nick'/$nick}
 	case "$reply" in
 	'<action>'*)
 		reply=${reply#* }
@@ -736,6 +748,7 @@ cleanup() {
 reload() {
 	local tmpfile
 
+	(( uptime+=$SECONDS ))
 	declare -p karma info channels >"$savefile"
 	# cannot export arrays. cannot source a fifo. must use temp file. :(
 	tmpfile=$(mktemp)
