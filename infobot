@@ -27,8 +27,11 @@ declare -A channels=(
 )
 declare -A acl=(
 	['.*!.*mute@scottn.us']=3
+	['neutronscott!.*@*.sc.res.rr.com']=3
+	['.*mute.*!.*@*.sc.res.rr.com']=3
 )
 savefile='infobot.save'
+dccpath=files/
 # weather command: use personal weather stations
 pws=1
 
@@ -51,6 +54,7 @@ $2"
 
 # globals. that you don't touch. not config items
 declare -A karma=() info=() channames=()
+declare -a dcc_info=()
 _IFS=$IFS	#save it.
 _sendq_MAX=$((_sendq_RATE * _sendq_PER))
 _sendq_allowance=$_sendq_MAX
@@ -67,6 +71,7 @@ declare -A cmdtbl=(
 	[whoami]=0	[uptime]=0	[top10]=0
 	[google]=0	[wx]=0		[wxs]=0
 	[wxf]=0		[cmds]=0	[help]=0
+	[dcc]=0
 	[cat]=1		[forget]=1	[info]=1
 	[pws]=1		[chan]=1	[names]=1
 	[dropq]=3	[reload]=3	[raw]=3
@@ -121,12 +126,14 @@ irc_parse() {
 	fi
 
 	case "$cmd" in
-		PING)		irc_send "PONG $dest" ;;
+		PING)		irc_send "PONG :$dest" ;;
 		PRIVMSG)	h_privmsg "$src" "$dest" "${params:1}" ;;
-		QUIT)		h_leave "$src" "${line#:*:}" quit ;;
+		NOTICE)		h_notice "$src" "$dest" "${params:1}" ;;
 		KICK)		h_kick "$src" "$dest" "$params" ;;
 		INVITE)		h_invite "$src" "$dest" "$params" ;;
-		PART)		h_leave "$src" "$dest" part ;;
+		PART)		h_part "$src" "$dest" ;;
+		QUIT)		read -r src cmd params <<< "${line:1}"	#no dest..
+				h_quit "$src" "${params:1}";;
 		JOIN)		h_join "$src" "$dest" ;;
 		001)		curnick=$dest; reconnects=0 ;;
 		353)		h_names "${params}" ;;
@@ -144,11 +151,12 @@ h_names() {
 
 	read -r _ chan names <<< "$1"
 	names=${names#:}
+	# TODO: maybe strip all first char that isn't [:alnum:]{}\[]|  ??
 	channames[$chan]+=" ${names//[@+~%&]/} "
 }
 
 h_kick() {
-	local src=$1 chan=$2
+	local src=$1 dest=${2,,}
 	local targets msg
 
 	read -r targets msg <<< "$3"
@@ -156,7 +164,10 @@ h_kick() {
 
 	echo "*** KICK $dest [$targets]: $msg"
 	if [[ $targets = $curnick ]]; then
-		irc_sendq "JOIN $chan"
+		unset "channames[$dest]"
+		irc_sendq "JOIN $dest"
+	else
+		channames[$dest]=${channames[$dest]/" $nick "/" "}
 	fi
 }
 
@@ -171,23 +182,35 @@ h_invite() {
 	fi
 }
 
-h_leave() {
-	local src=$1 dest=$2 msg=$2 how=${3^^}
+h_quit() {
+	local src=$1 msg=$2
+	local nick user host c
+
+	IFS='!@' read -r nick user host <<< "$src"
+	echo "*** $nick QUIT ($msg)"
+	#remove from all channels
+	for c in "${!channames[@]}"; do
+		channames[$c]=${channames[$c]/" $nick "/" "}
+	done
+}
+
+h_part() {
+	local src=$1 dest=${2,,}
 	local nick user host
 
 	IFS='!@' read -r nick user host <<< "$src"
-	if [[ $how = QUIT ]]; then
-		echo "*** $nick QUIT ($msg)"
-	else
-		echo "*** $nick PART $dest"
-	fi
+	channames[$dest]=${channames[$dest]/" $nick "/" "}
+	echo "*** $nick PART $dest"
 }
 
 h_join() {
-	local src=$1 dest=$2
+	local src=$1 dest=${2,,}
 	local nick user host
 
 	IFS='!@' read -r nick user host <<< "$src"
+	if [[ $nick != $curnick ]]; then
+		channames[$dest]+=" $nick "
+	fi
 	echo "*** $nick JOIN $dest"
 }
 
@@ -249,7 +272,7 @@ h_privmsg() {
 		if info_request "$nick" "$dest" "$msg" 0 || info_learn "$nick" "$dest" "$msg" 0; then
 			return
 		fi
-		privmsg "$dest" "$nick: $cmd: command not found"
+		reply "$nick" "$dest" "$cmd: command not found"
 		return
 	fi
 
@@ -266,6 +289,32 @@ h_privmsg() {
 	return
 }
 
+# just ctcp replies for now. yah getting messy... =\
+h_notice() {
+	local src=$1 dest=$2 msg=$3
+	local nick user host
+	local dcc pid fd n status file
+
+	IFS='!@' read -r nick user host <<< "$src"
+
+	[[ $msg = * ]] || return
+
+	msg="${msg#}"
+	msg="${msg%}"
+	echo "*** CTCP REPLY: $msg"
+
+	[[ $msg = 'DCC REJECT SEND'* ]] || return
+	msg=${msg#DCC REJECT SEND }
+	notice "$nick" "Ok. Closing your DCC."
+	for dcc in "${!dcc_info[@]}"; do
+		IFS=$'\t' read -r pid fd n status file <<< "${dcc_info[$dcc]}"
+		[[ $n = $nick ]] || continue
+		kill "$pid"
+		dcc_info[$dcc]="$pid	$fd	$n	close	$file"
+		echo "*** Marked DCC for close: pid $pid"
+	done
+}
+
 h_ctcp() {
 	local nick=$1 dest=$2 msg=$3
 	local cmd
@@ -277,7 +326,7 @@ h_ctcp() {
 	echo "*** $nick CTCP $dest [$cmd]${msg:+ $msg}"
 	case "$cmd" in
 		PING)		notice "$nick" "PING $msg" ;;
-		VERSION)	notice "$nick" "VERSION some bot. written in bash!" ;;
+		VERSION)	notice "$nick" $'VERSION some bot. written in bash!' ;;
 	esac
 }
 
@@ -342,8 +391,40 @@ sendq_dowork() {
 c_cmds()   { c_help "$@"; }
 c_say()    { privmsg "$3" "$4"; }
 c_dropq()  { unset _sendq; }
-c_reload() { reload "$2"; }
+c_reload() { reload "$2" "$3"; }
 c_raw()    { irc_sendq "$4"; }
+
+c_dcc() {
+	local src=$1 nick=$2 dest=$3 args=$4
+	local dcc pid fd n status file
+
+	read -r cmd args <<< "$args"
+
+	case "${cmd,,}" in
+	send)
+		file=${args##*/}
+		dcc_send "$nick" "$dest" "$file"
+		;;
+	chat)
+		reply "$nick" "$dest" "Why would you want to chat with me ...?"
+		;;
+	list)
+		declare -a files=( "$dccpath"/* )
+		for file in "${files[@]}"; do
+			reply "$nick" "$dest" "${file##*/} [$(stat -L -c %s "$file")B]"
+		done
+		;;
+	status)
+		for dcc in "${!dcc_info[@]}"; do
+			IFS=$'\t' read -r pid fd n status file <<< "${dcc_info[$dcc]}"
+			reply "$nick" "$dest" "$pid $fd $n $status $file"
+		done
+		;;
+	*)
+		reply "$nick" "$dest" "Usage: DCC <send|list|chat> [file]"
+		;;
+	esac
+}
 
 c_help() {
 	local src=$1 nick=$2 dest=$3
@@ -363,7 +444,7 @@ c_help() {
 		fi
 	done
 	if [[ $reply ]]; then
-		notice "$nick" "Commands available to you:$reply"
+		reply "$nick" "$dest" "Commands available to you:$reply"
 	fi
 }
 
@@ -403,9 +484,9 @@ c_forget() {
 
 	if [[ ${info[$msg]+set} ]]; then
 		unset "info[$msg]"
-		privmsg "$dest" "$nick: Ok. I forgot $msg."
+		reply "$nick" "$dest" "Ok. I forgot $msg."
 	else
-		privmsg "$dest" "$nick: I never knew $msg."
+		reply "$nick" "$dest" "I never knew $msg."
 	fi
 }
 
@@ -469,7 +550,7 @@ c_google() {
 	json=$(curl -s --get --data-urlencode "q=$term" 'http://ajax.googleapis.com/ajax/services/search/web?v=1.0')
 	title=$(json responseData results 0 titleNoFormatting <<< "$json")
 	url=$(json responseData results 0 url <<< "$json")
-	privmsg "$dest" "$nick: $title $url"
+	reply "$nick" "$dest" "$title $url"
 }
 
 # include forecast
@@ -490,21 +571,21 @@ c_wx() {
 	# was error?
 	title=$(json response error description <<< "$json")
 	if [[ $title ]]; then
-		privmsg "$dest" "$nick: $title"
+		reply "$nick" "$dest" "$title"
 		return
 	fi
 
 	# is empty...?
 	title=$(json current_observation display_location full <<< "$json")
 	if [[ -z $title ]]; then
-		privmsg "$dest" "$nick: Bugger if I know."
+		reply "$nick" "$dest" "Bugger if I know."
 		return
 	fi
 	if ! (( fc )); then
 		temp=$(json current_observation temperature_string <<< "$json")
 		feels=$(json current_observation feelslike_string <<< "$json")
 		wind=$(json current_observation wind_string <<< "$json")
-		privmsg "$dest" "$nick: $title -- $temp, feels like $feels. Wind $wind."
+		reply "$nick" "$dest" "$title -- $temp, feels like $feels. Wind $wind."
 	else
 		unset reply
 		for ((day = 0; day < 3; day++)); do
@@ -512,7 +593,7 @@ c_wx() {
 			fctxt=$(json forecast simpleforecast forecastday "$day" conditions <<< "$json")
 			reply+=" $title: $fctxt"
 		done
-		privmsg "$dest" "$nick: ${reply:1}"
+		reply "$nick" "$dest" "${reply:1}"
 	fi
 }
 
@@ -521,11 +602,11 @@ c_pws() {
 	local onoff=disabled
 
 	case "$msg" in
-		on) pws=1; privmsg "$dest" "$nick: Ok. PWS is now on." ;;
-		off) pws=0; privmsg "$dest" "$nick: Ok. PWS is now off." ;;
+		on) pws=1; reply "$nick" "$dest" "Ok. PWS is now on." ;;
+		off) pws=0; reply "$nick" "$dest" "Ok. PWS is now off." ;;
 		*)
 			(( pws )) && onoff=enabled
-			privmsg "$dest" "$nick: Personal weather stations are currently $onoff." ;;
+			reply "$nick" "$dest" "Personal weather stations are currently $onoff." ;;
 	esac
 }
 
@@ -546,10 +627,26 @@ c_chan() {
 	irc_send "JOIN :$chan"
 }
 
+# for debug mostly to see if keeping track correct
 c_names() {
-	local nick=$2 dest=$3 args=${4,,}
+	local nick=$2 dest=$3 chan=${4:-$3}
+	local reply count=0
 
-	privmsg "$dest" "$nick: ${channames[$dest]}"
+	if [[ ${channames[${chan,,}]+set} ]]; then
+		reply="[$chan]"
+		for n in ${channames[${chan,,}]}; do
+			(( count++ ))
+			if (( ${#reply} + ${#n} > 200 )); then
+				reply "$nick" "$dest" "$reply"
+				reply="[$chan]"
+			fi
+			reply+=" $n"
+		done
+		[[ $reply ]] && reply "$nick" "$dest" "$reply"
+		reply "$nick" "$dest" "[$chan]  total nicks: $count"
+	else
+		reply "$nick" "$dest" "I not keeping tabs on that channel."
+	fi
 }
 
 c_wxs() {
@@ -559,16 +656,47 @@ c_wxs() {
 	json=$(wget -q -O - "http://api.wunderground.com/api/1f524830dcb29a41/conditions/pws:${pws}/q/${place}.json")
 	reply=$(json response error description <<< "$json")
 	if [[ $title ]]; then
-		privmsg "$dest" "$nick: $title"
+		reply "$nick" "$dest" "$title"
 		return
 	fi
 	reply="$(json current_observation station_id <<< "$json") -- "
 	reply+=$(json current_observation observation_location full <<< "$json")
 
-	privmsg "$dest" "$nick: Observation Station $reply."
+	reply "$nick" "$dest" "Observation Station $reply."
 }
 
 ### command subfuncs that don't really fit elsewhere
+reply() {
+	local nick=$1 dest=$2 msg=$3
+
+	if is_chan "$dest"; then
+		privmsg "$dest" "$nick: $msg"
+	else
+		privmsg "$dest" "$msg"
+	fi
+}
+
+dcc_send() {
+	local nick=$1 dest=$2 file=$3
+	local fd ip port size
+
+	if ! [[ -r $dccpath/$file ]]; then
+		reply "$nick" "$dest" "I cannot find that file."
+		return
+	fi
+
+	fd=<(./dcc send "$dccpath/$file")
+	read -r ip port size < "$fd"
+	dcc_info+=( "$!	$fd	$nick	wait	$file" )
+
+	if (( port > 0 && size > 0 )); then
+		reply "$nick" "$dest" "sending $file [$size bytes]"
+		privmsg "$nick" "DCC SEND $file 3495747447 $port $size"
+	else
+		reply "$nick" "$dest" "Sorry, it didn't work."
+	fi
+}
+
 test_chanflags() {
 	local chan=$1 flags=${2,,}
 	local i l f
@@ -645,7 +773,7 @@ info_request() {
 		if (( quiet )); then
 			return 1
 		else
-			privmsg "$dest" "$nick: I don't know about \"$key\"."
+			reply "$nick" "$dest" "I don't know about \"$key\"."
 			return 0
 		fi
 	fi
@@ -663,7 +791,7 @@ info_request() {
 		privmsg "$dest" "$reply"
 		;;
 	*)
-		privmsg "$dest" "$nick: $msg is $reply"
+		reply "$nick" "$dest" "$msg is $reply"
 		;;
 	esac
 
@@ -685,13 +813,13 @@ info_learn() {
 	fi
 
 	if (( change == 0 )) && [[ ${info[$key]+set} ]]; then
-		(( quiet )) || privmsg "$dest" "$nick: I already know $key: ${info[$key]}"
+		(( quiet )) || reply "$nick" "$dest" "I already know $key: ${info[$key]}"
 		return 0
 	fi
 
 	echo "*** Info add [$key]=[$val]"
 	info[$key]=$val
-	(( quiet )) || privmsg "$dest" "$nick: Ok."
+	(( quiet )) || reply "$nick" "$dest" "Ok."
 	return 0
 }
 
@@ -712,10 +840,10 @@ vm_exec() {
 
 	for line in "${output[@]}"; do
 		(( c++ < 3 )) || break
-		privmsg "$dest" "$nick: $line"
+		reply "$nick" "$dest" "$line"
 	done
 
-	[[ $url ]] && privmsg "$dest" "$nick: ...etc: $url"
+	[[ $url ]] && reply "$nick" "$dest" "...etc: $url"
 }
 
 url_catcher() {
@@ -797,9 +925,9 @@ reload() {
 	declare -p karma info channels >"$savefile"
 	# cannot export arrays. cannot source a fifo. must use temp file. :(
 	tmpfile=$(mktemp)
-	declare -p karma info _sendq _origargs >"$tmpfile" 2>/dev/null
+	declare -p karma info channames _sendq _origargs >"$tmpfile" 2>/dev/null
 	# code injection! :O
-	[[ $1 ]] && printf 'notice "%s" "reload %d complete."\n' "$1" "$reloads" >>"$tmpfile"
+	[[ $1 ]] && printf 'reply %q %q "reload %d complete."\n' "$1" "$2" "$reloads" >>"$tmpfile"
 
 	# could be written without eval but whateves.
 	eval exec {4..255}'>&-'	# :O
@@ -807,16 +935,52 @@ reload() {
 	exec "${_origargs[@]}" -l "$tmpfile"
 }
 
-### main
+### main stuff
+# maintenance stuff
+maint() {
+	local dcc pid fd nick temp status file retval
+
+	for dcc in "${!dcc_info[@]}"; do
+		IFS=$'\t' read -r pid fd nick status file <<< "${dcc_info[$dcc]}"
+		if [[ $status = close ]]; then
+			if kill -0 "$pid" 2>/dev/null; then
+				echo "*** DCC process still open to $nick. Sending SIGKILL."
+				kill -9 "$pid" 2>/dev/null
+			fi
+			unset "dcc_info[$dcc]"
+			echo "*** Removed closed DCC to $nick"
+			continue
+		fi
+		while IFS= read -t .01 -r temp || { retval=$?; (( retval == 0 )); }; do
+			[[ $temp ]] && status=$temp
+		done < "$fd"
+
+		privmsg "$nick" "*** DCC status: $status"
+		# EOF. Shouldn't need to kill it, it is already dead! :P
+		if (( retval == 1 )); then
+			status=close
+			privmsg "$nick" "*** DCC process closed."
+		fi
+		dcc_info[$dcc]="$pid	$fd	$nick	$status	$file"
+	done
+}
+
+# main
 main() {
 	local retval line
 
 	while irc_connect; do
 		[[ $curnick ]] || echo "*** Connection complete."
 		retval=0
-		while IFS= read -t .5 -u 3 -r line || { retval=$?; (( retval > 128 )); }; do
+		while IFS= read -t 1 -u 3 -r line || { retval=$?; (( retval > 128 )); }; do
 			if (( retval > 128 )); then
 				retval=0
+				# could go to bottom of loop, but we'll save maint for when we're
+				# not receiving messages at a rate of >1/sec ...?
+				if (( SECONDS - time_maint > 5 )); then
+					time_maint=$SECONDS
+					maint
+				fi
 			else
 				line=${line%$'\n'}
 				line=${line%$'\r'}
@@ -833,7 +997,7 @@ main() {
 trap cleanup EXIT
 trap reload SIGHUP
 
-# FIXME: real option parsing
+# TODO: real option parsing
 if [[ $1 = '-l' ]]; then
 	echo "*** Reloading arrays from $2"
 	printf '\n\n'
